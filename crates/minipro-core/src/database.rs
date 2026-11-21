@@ -1550,7 +1550,8 @@ fn build_device(
     let data_memory_size = get_attr_u32(e, b"data_memory_size").unwrap_or(0);
     let mut data_memory2_size = get_attr_u32(e, b"data_memory2_size").unwrap_or(0);
     let page_size = get_attr_u32(e, b"page_size").unwrap_or(0);
-    let mut pages_per_block = get_attr_u32(e, b"pages_per_block").unwrap_or(0);
+    let pages_per_block_raw = get_attr_u32(e, b"pages_per_block").unwrap_or(0);
+    let mut pages_per_block = pages_per_block_raw;
     let chip_id = get_attr_u32(e, b"chip_id").unwrap_or(0);
     let voltages_raw = get_attr_u32(e, b"voltages").unwrap_or(0);
     let pulse_delay = get_attr_u32(e, b"pulse_delay").unwrap_or(0);
@@ -1588,6 +1589,17 @@ fn build_device(
         pages_per_block &= 0x00ff_ffff;
         data_memory2_size = 0;
     }
+
+    // Keep NAND vendor flags separate from the page count, including entries
+    // whose capacity is already populated. INFOIC fields pass through unchanged.
+    let nand_flags = if !matches!(model, ProgrammerModel::Tl866a | ProgrammerModel::Tl866cs)
+        && protocol_id == IC2_ALG_NAND
+    {
+        pages_per_block &= 0x00ff_ffff;
+        (pages_per_block_raw >> 24) as u8
+    } else {
+        0
+    };
 
     // Apply can_adjust_clock / can_adjust_address per programmer model
     const IC2_ALG_SPI25F_1: u8 = 0x03;
@@ -1678,6 +1690,7 @@ fn build_device(
         data_memory2_size,
         page_size,
         pages_per_block,
+        nand_flags,
         chip_id,
         chip_id_bytes_count,
         voltages,
@@ -1739,6 +1752,7 @@ fn build_logic_device(e: &BytesStart, name: &str, manufacturer: &str) -> Result<
         data_memory2_size: 0,
         page_size: 0,
         pages_per_block: 0,
+        nand_flags: 0,
         chip_id: 0,
         chip_id_bytes_count: 0,
         voltages: crate::device::Voltages {
@@ -1872,6 +1886,31 @@ mod tests {
                 "embedded {name}.gz is stale — regenerate crates/minipro-core/embedded/"
             );
         }
+    }
+
+    #[test]
+    fn test_micron_nand_packed_page_count() {
+        let entry = BytesStart::from_content(
+            r#"ic type="6" protocol_id="0x2d" variant="0xc500"
+            read_buffer_size="0x2100" write_buffer_size="0x840"
+            code_memory_size="0x21000000" page_size="0x1000"
+            pages_per_block="0x10000040" voltages="0x80006""#,
+            2,
+        );
+        let dev = build_device(
+            &entry,
+            "MT29F4G08ABBDAH4@VFBGA63(NW189)",
+            "Micron",
+            ProgrammerModel::T76,
+            false,
+            &HashMap::new(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(dev.pages_per_block, 64);
+        assert_eq!(dev.nand_flags, 0x10);
+        assert_eq!(dev.code_memory_size, 4096 * 64 * 2112);
+        assert_eq!(dev.voltages.raw & 0xff, 0x06);
     }
 
     const LOGICIC_FIXTURE: &str = r#"<?xml version="1.0" encoding="utf-8"?>
@@ -2338,6 +2377,7 @@ mod tests {
         // 0x400 blocks * 0x40 pages * 0x880 bytes (page+spare) = 0x8800000
         assert_eq!(dev.code_memory_size, 0x880_0000);
         assert_eq!(dev.pages_per_block, 0x40);
+        assert_eq!(dev.nand_flags, 0x80);
         assert_eq!(dev.data_memory2_size, 0);
         // page_size keeps the block count — the begin-transaction
         // prelude needs it verbatim.
@@ -2352,6 +2392,7 @@ mod tests {
         let dev = find_device(&paths, "NANDPACKED", ProgrammerModel::Tl866a).unwrap();
         assert_eq!(dev.code_memory_size, 0);
         assert_eq!(dev.pages_per_block, 0x8000_0040);
+        assert_eq!(dev.nand_flags, 0);
         assert_eq!(dev.data_memory2_size, 4);
     }
 

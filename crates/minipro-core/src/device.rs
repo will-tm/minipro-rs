@@ -780,6 +780,8 @@ pub struct Device {
     pub page_size: u32,
     /// NAND flash: pages per erase block.
     pub pages_per_block: u32,
+    /// Vendor flags from the high byte of the NAND pages-per-block field.
+    pub nand_flags: u8,
     /// Expected manufacturer/chip ID read from the device.
     pub chip_id: u32,
     /// Number of significant bytes in [`Device::chip_id`].

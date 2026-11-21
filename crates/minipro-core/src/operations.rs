@@ -46,7 +46,7 @@ fn effective_transfer_size(file_len: usize, device_size: usize, read_buffer_size
 /// For all other chip types it falls back to the database `buffer_size` field.
 fn effective_block_size(device: &Device, buffer_size: u16) -> usize {
     if device.chip_type == ChipType::Nand as u32 && device.pages_per_block > 0 {
-        (buffer_size as usize) * (device.pages_per_block as usize)
+        (device.write_buffer_size as usize) * (device.pages_per_block as usize)
     } else if device.chip_type == ChipType::Emmc as u32 {
         0x10000
     } else {
@@ -1670,6 +1670,19 @@ mod tests {
             pack_uid_values(&device, 1, &values).unwrap(),
             Some(vec![0xef, 0x3e])
         );
+    }
+
+    #[test]
+    fn test_nand_reads_one_block_including_spare() {
+        let dev = Device {
+            chip_type: ChipType::Nand as u32,
+            read_buffer_size: 0x2100,
+            write_buffer_size: 0x840,
+            pages_per_block: 64,
+            ..Device::default()
+        };
+        assert_eq!(effective_block_size(&dev, dev.read_buffer_size), 0x21000);
+        assert_eq!(effective_block_size(&dev, dev.write_buffer_size), 0x21000);
     }
 
     #[test]

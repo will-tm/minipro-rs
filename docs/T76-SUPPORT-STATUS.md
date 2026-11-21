@@ -260,3 +260,14 @@ placeholder. Real capacity is detected at runtime (see above).
 - `Protocol::effective_code_size()` trait method instead of
   `handle->emmc_capacity` field (Rust doesn't allow mutating `&self` in
   trait methods without interior mutability)
+
+## NAND packet packing
+
+The NAND geometry, socket setup, and ID request fields are documented in
+`KNOWN-BUGS.md` under "T76 NAND wire-format invariants". The Micron
+MT29F4G08ABBDAH4 profile has 4096 blocks, 64 pages per block, and 2112 bytes
+per page including spare bytes: a 135168-byte block and a 553648128-byte
+raw image. The XML page-count flag byte is `0x10`; the NAND voltage code
+is `0x06` (1.8 V). Firmware 1.20 requires the NAND socket power-routing
+extension in BEGIN bytes `0x40`–`0x5f`. Raw reads preserve physical page
+order and the 64 spare bytes after each 2048-byte data page.

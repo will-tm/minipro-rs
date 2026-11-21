@@ -1009,3 +1009,41 @@ disagreeing on the same filename.
 match against the lowercased value, and any new call site that
 classifies files by extension should go through `effective_format`
 rather than re-checking extensions itself.
+
+## T76 NAND wire-format invariants
+
+For protocol `0x2d`, `pages_per_block` in the XML contains a 24-bit page
+count and a high byte of vendor flags. `Device::pages_per_block` contains
+the count; `Device::nand_flags` retains the high byte for BEGIN offset
+`0x30`. NAND transfers use `write_buffer_size * pages_per_block` bytes,
+including spare bytes, for both reads and writes.
+
+The 64-byte `0x02` geometry command precedes the 128-byte `0x03` socket
+configuration. Geometry offsets `0x08` and `0x0a` contain spare size and
+main page size; offset `0x0c` retains the XML `page_size` block-count field.
+The parallel adapter-mode word is `0x00010000` and its conservative bus
+clock is `0x27154f3b`; the serial values are `0x00010001` and `0x0808230e`.
+BEGIN offset `0x08` contains the low 16 bits of
+`(data_memory2_size & 0xffff) * write_buffer_size`.
+
+For parallel NAND, BEGIN offsets `0x40`/`0x44` and `0x50`/`0x54` contain
+socket VCC/GND routing masks. The default E1/E2 eight-bit routing is
+`0x20000108`, `0x20`, `0x01002004`, `0x2000`, respectively. Firmware 1.20
+uses these fields to power the socket; clock configuration alone is not
+sufficient. The routing follows XGPro_T76 V13.27's packer at `0x4b8aa0`.
+
+NAND FPGA uploads use BEGIN control word `0x2000`, at most 504 payload
+bytes per packet, and an unpadded final packet. END retains the final
+payload length. Socket initialization sends `24 f0 08 00 01 00 00 00`,
+drains its eight-byte response, sends `24 f1 00 00 00 00 00 00`, and runs
+one 16-byte `0x3e` command before the upload.
+
+Standalone NAND READID requests include the expected ID byte count at
+offset `0x02`; offset `0x04` remains zero. No SET FEATURES command precedes
+standalone ID detection.
+
+Parallel NAND profiles with vendor flag `0x10` use volatile SET FEATURES
+address `0x80`, value `02 00 00 00`, before array reads to select half-strength
+outputs. This matches the XGPro_T76 V13.27 read path and leaves the chip's
+ECC setting unchanged. Each block arrives in groups of 16 complete NAND
+pages, including spare bytes; short transfers are rejected.

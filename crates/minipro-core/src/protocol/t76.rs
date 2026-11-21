@@ -171,7 +171,7 @@ fn put_le32(dst: &mut [u8], v: u32) {
 ///
 /// Protocol (from t76.c `t76_write_bitstream`):
 /// 1. BEGIN packet  — send 8 bytes, await 8-byte ACK (`resp[1] == 0`).
-/// 2. BLOCK packets — each is exactly 512 bytes (8 header + up to 504 payload).
+/// 2. BLOCK packets — 8 header bytes and up to 504 payload bytes.
 /// 3. END packet    — send 8 bytes, await 8-byte ACK (`resp[1] == 0`).
 fn upload_bitstream_t76(usb: &UsbDevice, bitstream: &[u8], is_nand: bool) -> Result<()> {
     let payload_size = BS_PACKET_SIZE - 8; // 504 bytes
@@ -180,7 +180,14 @@ fn upload_bitstream_t76(usb: &UsbDevice, bitstream: &[u8], is_nand: bool) -> Res
     let mut msg = [0u8; BS_PACKET_SIZE];
     msg[0] = CMD_WRITE_BITSTREAM;
     msg[1] = T76_BEGIN_BS;
-    put_le16(&mut msg[2..4], BS_PACKET_SIZE as u32);
+    put_le16(
+        &mut msg[2..4],
+        if is_nand {
+            0x2000
+        } else {
+            BS_PACKET_SIZE as u32
+        },
+    );
     put_le32(&mut msg[4..8], bitstream.len() as u32);
     usb.msg_send(&msg[..8])?;
 
@@ -202,15 +209,18 @@ fn upload_bitstream_t76(usb: &UsbDevice, bitstream: &[u8], is_nand: bool) -> Res
         pkt[1] = T76_BS_BLOCK;
         put_le16(&mut pkt[2..4], block_size as u32);
         pkt[8..8 + block_size].copy_from_slice(&bitstream[offset..block_end]);
-        usb.msg_send_large(&pkt)?;
+        let packet_len = if is_nand {
+            8 + block_size
+        } else {
+            BS_PACKET_SIZE
+        };
+        usb.msg_send_large(&pkt[..packet_len])?;
 
         offset += payload_size;
     }
 
     // ── Phase 3: END ──────────────────────────────────────────────────────────
-    // For NAND, the vendor puts the size of the final (partial) block in
-    // msg[2..3] so the FPGA finalizes the last config word. Without it the
-    // NAND FPGA is mis-finalized (READID/read return 0xFF).
+    // NAND retains the final payload length in the END header.
     let mut msg = [0u8; 8];
     msg[0] = CMD_WRITE_BITSTREAM;
     msg[1] = T76_END_BS;
@@ -266,26 +276,19 @@ fn t76_cmd_24(usb: &UsbDevice, cmd: &[u8; 8]) -> Result<()> {
 
 /// One-time socket-adapter power/init at session start.
 ///
-/// XGPro detects and energizes the adapter via this 0x24 sequence before any
-/// chip op; the BGA NAND adapter needs it (without it the NAND is never
-/// selected -> READID reads 0xFF and the data read gets no EP82 data).
+/// NAND socket initialization precedes the FPGA upload and drains the
+/// power-down response before configuring the pin drivers.
 fn t76_adapter_init(usb: &UsbDevice) -> Result<()> {
     const PWR_DOWN: [u8; 8] = [0x24, 0xf0, 0x08, 0x00, 0x01, 0x00, 0x00, 0x00];
-    const READ_ID: [u8; 8] = [0x24, 0xe4, 0x30, 0x00, 0x11, 0x01, 0x08, 0x00];
     const PWR_UP: [u8; 8] = [0x24, 0xf1, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00];
     t76_cmd_24(usb, &PWR_DOWN)?;
-    t76_cmd_24(usb, &READ_ID)?;
     t76_cmd_24(usb, &PWR_UP)?;
 
-    // Pin detection (0x3e, 16-byte T76 form), run twice like XGPro right
-    // after adapter power-up and before the bitstream. On the T76 this
-    // configures the socket pin drivers for the selected package.
-    for _ in 0..2 {
-        let mut pd = [0u8; 16];
-        pd[0] = CMD_PIN_DETECTION;
-        usb.msg_send(&pd)?;
-        let _ = usb.msg_recv(32)?;
-    }
+    // NAND socket initialization uses one pin-driver command before upload.
+    let mut pd = [0u8; 16];
+    pd[0] = CMD_PIN_DETECTION;
+    usb.msg_send(&pd)?;
+    usb.msg_recv(32)?;
     Ok(())
 }
 
@@ -624,6 +627,135 @@ fn t76_emmc_bring_up(usb: &UsbDevice) -> Result<u64> {
     Ok(capacity)
 }
 
+/// Pack the NAND geometry command sent before BEGIN_TRANS.
+fn build_nand_prelude(device: &Device) -> [u8; 64] {
+    let mut pre = [0u8; 64];
+    pre[0] = CMD_BEGIN_TRANS_LOGIC;
+
+    let page_or_blocks = device.page_size;
+    let ppb = device.pages_per_block;
+    let wbuf = device.write_buffer_size;
+    let mut real_page: u16 = 1;
+    while (real_page as u32) * 2 <= (wbuf as u32) {
+        real_page <<= 1;
+    }
+    let ps_code = if real_page < 0x800 {
+        4
+    } else if real_page == 0x800 {
+        8
+    } else if real_page == 0x1000 {
+        4
+    } else if real_page == 0x4000 {
+        1
+    } else {
+        2
+    };
+
+    let big = (ppb * page_or_blocks) > 0x10000;
+    let busw = if real_page >= 0x800 {
+        if big {
+            3
+        } else {
+            1
+        }
+    } else if big {
+        2
+    } else {
+        0
+    };
+    let serial = (device.variant & 0x70) != 0;
+
+    // Conservative low-speed clock entries from the vendor capture.
+    let clock = if serial { 0x0808_230e } else { 0x2715_4f3b };
+
+    put_le16(&mut pre[8..10], (wbuf - real_page) as u32);
+    put_le16(&mut pre[10..12], real_page as u32);
+    put_le16(&mut pre[12..14], page_or_blocks);
+    put_le16(&mut pre[14..16], ppb);
+    put_le16(&mut pre[16..18], 1); // plane count
+    put_le16(&mut pre[18..20], 1); // LUN count
+    put_le32(&mut pre[20..24], busw);
+    put_le32(&mut pre[24..28], ps_code);
+    put_le32(&mut pre[28..32], 0);
+    put_le32(
+        &mut pre[32..36],
+        if serial { 0x0001_0001 } else { 0x0001_0000 },
+    );
+    put_le32(&mut pre[36..40], clock);
+
+    pre
+}
+
+/// Pack NAND fields in the 128-byte BEGIN_TRANS socket configuration.
+fn configure_nand_begin(msg: &mut [u8; 128], device: &Device) {
+    // NAND metadata bytes are packed in data_memory2_size.
+    put_le16(
+        &mut msg[8..10],
+        (device.data_memory2_size & 0xffff) * device.write_buffer_size as u32,
+    );
+    // Per-block transfer size (data + spare) at msg[0x10].
+    if device.pages_per_block > 0 {
+        put_le32(
+            &mut msg[16..20],
+            (device.write_buffer_size as u32) * device.pages_per_block,
+        );
+    }
+    // NAND flag bit 0x800 in raw_flags.
+    put_le32(&mut msg[56..60], device.flags.raw | 0x800);
+    put_le32(&mut msg[0x60..0x64], 0x0b09_272f); // NAND clock config
+    msg[0x65] = 0x03;
+    msg[0x0e] = 0x20;
+    msg[0x14] = 0x00;
+    msg[0x18] = 0x03;
+    msg[0x1c] = 0x03;
+    // Pin/family byte for parallel NAND.
+    if (device.variant & 0x70) == 0 {
+        put_le32(&mut msg[0x28..0x2c], 0xe200_0000);
+        // T76 NAND socket VCC/GND routing (XGPro V13.27, 0x4b8c26).
+        let power = if device.nand_flags & 1 != 0 {
+            [0x2000_0200, 0, 4, 0x2000]
+        } else if device.nand_flags & 2 != 0 {
+            [0x0004_8000, 0, 0x00c0_0000, 0]
+        } else {
+            [0x2000_0108, 0x20, 0x0100_2004, 0x2000]
+        };
+        put_le32(&mut msg[0x40..0x44], power[0]);
+        put_le32(&mut msg[0x44..0x48], power[1]);
+        put_le32(&mut msg[0x50..0x54], power[2]);
+        put_le32(&mut msg[0x54..0x58], power[3]);
+    }
+    put_le32(
+        &mut msg[0x30..0x34],
+        device.pages_per_block | ((device.nand_flags as u32) << 24),
+    );
+}
+
+/// NAND READID carries the expected ID count; the remaining fields stay zero.
+fn build_read_id_msg(device: &Device) -> [u8; 8] {
+    let mut msg = [0u8; 8];
+    msg[0] = CMD_READ_ID;
+    if device.protocol_id == 0x2d {
+        put_le16(&mut msg[2..4], device.chip_id_bytes_count as u32);
+    }
+    msg
+}
+
+/// Volatile feature settings for parallel NAND profiles with programmable drive.
+fn nand_read_setup(device: &Device) -> Option<[u8; 12]> {
+    if device.protocol_id != 0x2d || device.variant & 0x70 != 0 || device.nand_flags & 0x10 == 0 {
+        return None;
+    }
+    // Match the vendor read path: half-strength output drivers.
+    Some([0x01, 0xef, 4, 0, 0x80, 0, 0, 0, 2, 0, 0, 0])
+}
+
+fn prepare_nand_read(usb: &UsbDevice, device: &Device) -> Result<()> {
+    if let Some(command) = nand_read_setup(device) {
+        usb.msg_send(&command)?;
+    }
+    Ok(())
+}
+
 // ── Protocol implementation ───────────────────────────────────────────────────
 
 impl Protocol for T76Protocol {
@@ -744,93 +876,16 @@ impl Protocol for T76Protocol {
                 }
             }
 
-            // NAND (protocol_id 0x2d): the FPGA algorithm bitstream drives the
-            // NAND command/address bus, so there is NO 0x40..0x5f geometry
-            // block. The only required extension bytes are the clock/timing
-            // dword and its cfg byte, plus the 128-byte length.
+            // NAND needs socket power routing and bus timing in the extension.
             if is_nand {
-                // Per-block transfer size (data + spare) at msg[0x10].
-                if device.pages_per_block > 0 {
-                    put_le32(
-                        &mut msg[16..20],
-                        (device.write_buffer_size as u32) * (device.pages_per_block & 0xffff),
-                    );
-                }
-                // NAND flag bit 0x800 in raw_flags.
-                put_le32(&mut msg[56..60], device.flags.raw | 0x800);
-                put_le32(&mut msg[0x60..0x64], 0x0b09_272f); // NAND clock config
-                msg[0x65] = 0x03;
-                msg[0x0e] = 0x20;
-                msg[0x14] = 0x00;
-                msg[0x18] = 0x03;
-                msg[0x1c] = 0x03;
-                // Pin/family byte for parallel NAND.
-                if (device.variant & 0x70) == 0 {
-                    put_le32(&mut msg[0x28..0x2c], 0xe200_0000);
-                }
-                msg[0x30] = 0x40;
+                configure_nand_begin(&mut msg, device);
                 msglen = 128;
             }
 
-            usb.msg_send(&msg[..msglen])?;
-        }
-
-        // 4. NAND: send the 64-byte opcode-0x02 "logic begin" prelude immediately
-        //    BEFORE the 0x03 BEGIN_TRANS. This programs the FPGA's NAND page/block
-        //    geometry and bus clock; without it the FPGA never clocks the NAND.
-        if is_nand {
-            let mut pre = [0u8; 64];
-            pre[0] = CMD_BEGIN_TRANS_LOGIC;
-
-            let page_or_blocks = device.page_size;
-            let ppb = device.pages_per_block & 0xffff;
-            let wbuf = device.write_buffer_size;
-            let mut real_page: u16 = 1;
-            while (real_page as u32) * 2 <= (wbuf as u32) {
-                real_page <<= 1;
+            if is_nand {
+                usb.msg_send(&build_nand_prelude(device))?;
             }
-            let ps_code = if real_page < 0x800 {
-                4
-            } else if real_page == 0x800 {
-                8
-            } else if real_page == 0x1000 {
-                4
-            } else if real_page == 0x4000 {
-                1
-            } else {
-                2
-            };
-
-            let big = (ppb * page_or_blocks) > 0x10000;
-            let busw = if real_page >= 0x800 {
-                if big {
-                    3
-                } else {
-                    1
-                }
-            } else if big {
-                2
-            } else {
-                0
-            };
-            let serial = (device.variant & 0x70) != 0;
-
-            // Conservative low-speed clock entries from the vendor capture.
-            let clock = if serial { 0x0f09_272f } else { 0x0b09_272f };
-
-            put_le16(&mut pre[8..10], ppb);
-            put_le16(&mut pre[10..12], page_or_blocks);
-            put_le16(&mut pre[12..14], page_or_blocks);
-            put_le16(&mut pre[14..16], ppb);
-            put_le16(&mut pre[16..18], 1); // plane count
-            put_le16(&mut pre[18..20], 1); // LUN count
-            put_le32(&mut pre[20..24], busw);
-            put_le32(&mut pre[24..28], ps_code);
-            put_le32(&mut pre[28..32], 0);
-            put_le32(&mut pre[32..36], 1); // adapter-mode byte at +2 = 1
-            put_le32(&mut pre[36..40], clock);
-
-            usb.msg_send(&pre)?;
+            usb.msg_send(&msg[..msglen])?;
         }
 
         // 5. eMMC: drain ID queries, detect capacity (EXT_CSD or env var),
@@ -879,11 +934,14 @@ impl Protocol for T76Protocol {
         if ds.page_type == MP_CODE {
             // NAND read: one erase-block (data + spare) per command.
             if device.protocol_id == 0x2d {
+                if ds.init {
+                    prepare_nand_read(usb, device)?;
+                }
                 let mut msg = [0u8; 16];
                 const NAND_READ_HDR: [u8; 12] = [
                     0x10, 0x00, 0x04, 0x00, // msg[4..7]
                     0x08, 0x00, 0x08, 0x00, // msg[8..b]
-                    0x69, 0x01, 0x00, 0x00, // msg[c..f]
+                    0x00, 0x00, 0x00, 0x00, // msg[c..f]
                 ];
                 let block_index = if size > 0 {
                     ds.address / (size as u32)
@@ -894,7 +952,21 @@ impl Protocol for T76Protocol {
                 put_le16(&mut msg[2..4], block_index);
                 msg[4..16].copy_from_slice(&NAND_READ_HDR);
                 usb.msg_send(&msg)?;
-                ds.data = usb.read_payload(size)?;
+                // Each transfer contains 16 complete NAND pages with spare bytes.
+                let chunk_size = device.write_buffer_size as usize * 16;
+                let mut data = Vec::with_capacity(size);
+                while data.len() < size {
+                    let expected = chunk_size.min(size - data.len());
+                    let chunk = usb.read_payload(expected)?;
+                    if chunk.len() != expected {
+                        return Err(MiniproError::ResponseTooShort {
+                            expected,
+                            actual: chunk.len(),
+                        });
+                    }
+                    data.extend_from_slice(&chunk);
+                }
+                ds.data = data;
                 return Ok(());
             }
 
@@ -1089,8 +1161,7 @@ impl Protocol for T76Protocol {
     }
 
     fn get_chip_id(&self, usb: &UsbDevice, device: &Device) -> Result<(u8, u32)> {
-        let mut msg = [0u8; 8];
-        msg[0] = CMD_READ_ID;
+        let msg = build_read_id_msg(device);
         usb.msg_send(&msg)?;
         let resp = usb.msg_recv(32)?;
         let id_length = device.chip_id_bytes_count.min(4) as usize;
@@ -1694,5 +1765,98 @@ mod tests {
         let mut avr = dip_device("ATMEGA328P@DIP28", 28, crate::device::MP_ZIF_ICSP);
         avr.package_details.icsp = 7;
         assert!(crate::protocol::t76_pin_test_supported(&avr));
+    }
+
+    #[test]
+    fn test_micron_nand_volatile_read_features() {
+        let mut dev = Device {
+            protocol_id: 0x2d,
+            variant: 0xc500,
+            nand_flags: 0x10,
+            ..Device::default()
+        };
+        // XGPro_T76 V13.27 array-read setup packet.
+        assert_eq!(
+            nand_read_setup(&dev),
+            Some([1, 0xef, 4, 0, 0x80, 0, 0, 0, 2, 0, 0, 0])
+        );
+        dev.nand_flags = 0;
+        assert_eq!(nand_read_setup(&dev), None);
+        dev.nand_flags = 0x10;
+        dev.variant = 0xc510;
+        assert_eq!(nand_read_setup(&dev), None);
+        dev.protocol_id = 3;
+        dev.variant = 0xc500;
+        assert_eq!(nand_read_setup(&dev), None);
+    }
+
+    #[test]
+    fn test_micron_nand_begin_fields() {
+        let dev = Device {
+            protocol_id: 0x2d,
+            variant: 0xc500,
+            pages_per_block: 64,
+            nand_flags: 0x10,
+            read_buffer_size: 0x2100,
+            write_buffer_size: 2112,
+            code_memory_size: 0x21000000,
+            page_size: 4096,
+            data_memory2_size: 0x2001e,
+            pulse_delay: 0x1010040,
+            pin_map: 0xd0008170,
+            chip_info: 0xa0,
+            voltages: crate::device::Voltages::from_raw(0x80006),
+            package_details: crate::device::PackageDetails::from_raw(0x22000000),
+            flags: crate::device::DeviceFlags::from_raw(0x78, 0xa0, 0x80006),
+            ..Device::default()
+        };
+        let mut msg = [0u8; 128];
+        msg[..64].copy_from_slice(&build_begin_msg(&dev, 0));
+        msg[63] = (dev.variant >> 8) as u8;
+        configure_nand_begin(&mut msg, &dev);
+        // XGPro_T76 V13.27 USB capture for the NW189 Micron profile.
+        let expected = concat!(
+            "032d00000600a07080f700104000200000100200000600000300000003000000",
+            "0000000000000000000000e200210000400000100000000078080000000000c5",
+            "0801002020000000000000000000000004200001002000000000000000000000",
+            "2f27090b00030000000000000000000000000000000000000000000000000000",
+        );
+        let actual: String = msg.iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn test_nand_read_id_request() {
+        let dev = Device {
+            protocol_id: 0x2d,
+            chip_id_bytes_count: 2,
+            ..Device::default()
+        };
+        // XGPro_T76 V13.27 standalone device-ID request.
+        assert_eq!(build_read_id_msg(&dev), [5, 0, 2, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            build_read_id_msg(&Device::default()),
+            [5, 0, 0, 0, 0, 0, 0, 0]
+        );
+    }
+
+    #[test]
+    fn test_micron_nand_prelude() {
+        let dev = Device {
+            protocol_id: 0x2d,
+            variant: 0xc500,
+            page_size: 4096,
+            pages_per_block: 64,
+            write_buffer_size: 2112,
+            ..Device::default()
+        };
+        // XGPro_T76 V13.19: geometry packer 0x4431a2..0x443322;
+        // parallel bus clock table 0x6a4418, entry 3.
+        let expected = [
+            0x02, 0, 0, 0, 0, 0, 0, 0, 0x40, 0, 0, 0x08, 0, 0x10, 0x40, 0, 1, 0, 1, 0, 3, 0, 0, 0,
+            8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0x3b, 0x4f, 0x15, 0x27, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(build_nand_prelude(&dev), expected);
     }
 }

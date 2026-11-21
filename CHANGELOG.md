@@ -6,6 +6,8 @@
 
 ### Fixed
 
+- T76 NAND ID detection and raw reads on firmware 1.20: configure socket power routing, match XGPro FPGA upload and adapter initialization, send geometry before socket setup, retain NAND flags separately from page counts, and read complete erase blocks including spare bytes.
+
 - **Uppercase file extensions bypassed format autodetection** — `effective_format` matched extensions case-sensitively (`"hex"`/`"srec"`/`"mot"`/`"jed"` only), so a file like `MM3usa12f629.HEX` fell through to raw binary: reads/writes treated the file's ASCII text as chip data (a PIC12F629 write reported `buffer size 2896` = the file's byte length, then failed verify with `expected 0x3a` — ASCII `':'`, the Intel HEX record start code) and `-r dump.HEX` wrote binary output to a `.HEX`-named file. Extension matching is now case-insensitive across read, write, verify, and reference-file paths.
 
 ## [0.14.1] - 2026-11-20
