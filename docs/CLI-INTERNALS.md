@@ -250,3 +250,11 @@ only), `pulse` (µs), `spi_clock` (raw index), `address` (I²C slave,
   no `-o` override was given. Purpose: ICSP/in-circuit work, where the
   target board loads the VCC rail and trips the default limit — the
   hardware OVC protection stays active, just at the higher trip point.
+
+## Device-ID transaction ownership
+
+The CLI opens the device transaction before dispatching operations and closes
+it after dispatch returns, including errors. `-D` reads the ID inside that
+transaction. It must not send another BEGIN or END: the T76 NAND geometry
+prelude belongs to the socket initialization, and repeating BEGIN inside an
+active transaction can block the next USB command.

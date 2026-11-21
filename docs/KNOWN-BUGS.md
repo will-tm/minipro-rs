@@ -1009,3 +1009,11 @@ disagreeing on the same filename.
 match against the lowercased value, and any new call site that
 classifies files by extension should go through `effective_format`
 rather than re-checking extensions itself.
+
+## CLI device-ID transaction ownership
+
+The CLI opens a transaction before dispatching `-D` and closes it after
+operation dispatch returns, including errors. The device-ID handler sends
+only READID within that transaction. A nested BEGIN repeats T76 NAND socket
+initialization while the transaction is active and can block the next USB
+command; a nested END duplicates the centralized cleanup.
