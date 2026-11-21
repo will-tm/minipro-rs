@@ -47,27 +47,30 @@ fn block_on_with_timeout<F, T>(fut: F, timeout: Duration) -> Result<T>
 where
     F: std::future::Future<Output = T> + std::marker::Unpin,
 {
-    let timer = timer_future(timeout);
-    match pollster::block_on(futures::future::select(fut, timer)) {
+    let (cancel_tx, cancel_rx) = std::sync::mpsc::channel::<()>();
+    let (timer_tx, timer_rx) = futures::channel::oneshot::channel();
+    let timer_thread = std::thread::Builder::new()
+        .spawn(move || {
+            if matches!(
+                cancel_rx.recv_timeout(timeout),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ) {
+                let _ = timer_tx.send(());
+            }
+        })
+        .map_err(MiniproError::Io)?;
+    let result = match pollster::block_on(futures::future::select(fut, timer_rx)) {
         futures::future::Either::Left((result, _)) => Ok(result),
         futures::future::Either::Right(_) => Err(MiniproError::Protocol(
             "USB transfer timed out — the programmer may be in a bad state. \
              Unplug it, wait 20-30 seconds, plug it back in, and try again."
                 .into(),
         )),
-    }
-}
-
-/// Create a future that completes after `duration`.  Uses a background
-/// thread + `futures::channel::oneshot` because pollster has no built-in
-/// timer.
-fn timer_future(duration: Duration) -> futures::channel::oneshot::Receiver<()> {
-    let (tx, rx) = futures::channel::oneshot::channel();
-    std::thread::spawn(move || {
-        std::thread::sleep(duration);
-        let _ = tx.send(());
-    });
-    rx
+    };
+    // Release the timer worker as soon as the transfer completes.
+    drop(cancel_tx);
+    let _ = timer_thread.join();
+    result
 }
 
 // ── USB VID/PID constants ────────────────────────────────────────────────────
@@ -531,4 +534,33 @@ fn deinterleave(ep2: &[u8], ep3: &[u8], total: usize) -> Vec<u8> {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod timeout_tests {
+    use super::*;
+
+    #[test]
+    fn completed_transfer_cancels_long_timeout() {
+        #[cfg(target_os = "linux")]
+        let threads_before = std::fs::read_dir("/proc/self/task").unwrap().count();
+        let start = std::time::Instant::now();
+        for _ in 0..100 {
+            assert_eq!(
+                block_on_with_timeout(futures::future::ready(42), USB_RECV_TIMEOUT).unwrap(),
+                42
+            );
+        }
+        assert!(start.elapsed() < Duration::from_secs(5));
+        #[cfg(target_os = "linux")]
+        assert!(std::fs::read_dir("/proc/self/task").unwrap().count() <= threads_before + 4);
+    }
+
+    #[test]
+    fn pending_transfer_times_out() {
+        assert!(matches!(
+            block_on_with_timeout(futures::future::pending::<()>(), Duration::from_millis(1)),
+            Err(MiniproError::Protocol(message)) if message.contains("timed out")
+        ));
+    }
 }

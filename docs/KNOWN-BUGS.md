@@ -1009,3 +1009,10 @@ disagreeing on the same filename.
 match against the lowercased value, and any new call site that
 classifies files by extension should go through `effective_format`
 rather than re-checking extensions itself.
+
+## USB transfer timeout lifetime
+
+`block_on_with_timeout` cancels and joins its timer worker when the USB
+future completes. A NAND read issues thousands of transfers; retaining a
+sleeping worker for each six-minute receive timeout exhausts the process
+thread limit. Pending transfers still cancel when the timeout expires.
